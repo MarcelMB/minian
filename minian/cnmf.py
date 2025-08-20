@@ -623,7 +623,7 @@ def compute_trace(
     f = f.fillna(0).data.reshape((-1, 1))
     AtA = darr.tensordot(A, A, axes=[(1, 2), (1, 2)]).compute()
     A_norm = (
-        (1 / (A ** 2).sum(axis=(1, 2)))
+        (1 / (A**2).sum(axis=(1, 2)))
         .map_blocks(
             lambda a: sparse.diagonalize(sparse.COO(a)), chunks=(A.shape[0], A.shape[0])
         )
@@ -673,6 +673,7 @@ def update_temporal(
     post_scal=False,
     scs_fallback=False,
     concurrent_update=False,
+    skip_deconvolution=False,
 ) -> Tuple[
     xr.DataArray, xr.DataArray, xr.DataArray, xr.DataArray, xr.DataArray, xr.DataArray
 ]:
@@ -791,6 +792,10 @@ def update_temporal(
         Yields slightly more accurate estimation when cross-talk between cells
         are severe, but significantly increase convergence time and memory
         demand. By default `False`.
+    skip_deconvolution : bool, optional
+        If True, skip the deconvolution optimization and return raw YrA traces
+        as the deconvolved spikes. This is useful when deconvolution causes
+        problems in the pipeline. By default `False`.
 
     Returns
     -------
@@ -919,6 +924,7 @@ def update_temporal(
                     max_iters=max_iters,
                     scs_fallback=scs_fallback,
                     zero_thres=zero_thres,
+                    skip_deconvolution=skip_deconvolution,
                 )
             )[0]
         c_ls.append(darr.from_delayed(res[0], shape=cur_YrA.shape, dtype=cur_YrA.dtype))
@@ -1066,7 +1072,7 @@ def get_ar_coef(
     else:
         max_lag = p + add_lag
     cov = acovf(y, fft=True)
-    C_mat = toeplitz(cov[:max_lag], cov[:p]) - sn ** 2 * np.eye(max_lag, p)
+    C_mat = toeplitz(cov[:max_lag], cov[:p]) - sn**2 * np.eye(max_lag, p)
     g = lstsq(C_mat, cov[1 : max_lag + 1])[0]
     if pad:
         res = np.zeros(pad)
@@ -1097,7 +1103,8 @@ def update_temporal_block(
     use_smooth=True,
     med_wd=None,
     concurrent=False,
-    **kwargs
+    skip_deconvolution=False,
+    **kwargs,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Update temporal components given residule traces of a group of cells.
@@ -1129,6 +1136,9 @@ def update_temporal_block(
     concurrent : bool, optional
         Whether to update a group of cells as a single optimization problem. By
         default `False`.
+    skip_deconvolution : bool, optional
+        If True, skip the deconvolution optimization and return raw YrA traces
+        as the deconvolved spikes. By default `False`.
 
     Returns
     -------
@@ -1188,11 +1198,15 @@ def update_temporal_block(
         for i, cur_yra in enumerate(YrA):
             YrA[i, :] = med_baseline(cur_yra, med_wd)
     if concurrent:
-        c, s, b, c0 = update_temporal_cvxpy(YrA, g, tn, **kwargs)
+        c, s, b, c0 = update_temporal_cvxpy(
+            YrA, g, tn, skip_deconvolution=skip_deconvolution, **kwargs
+        )
     else:
         res_ls = []
         for cur_yra, cur_g, cur_tn in zip(YrA, g, tn):
-            res = update_temporal_cvxpy(cur_yra, cur_g, cur_tn, **kwargs)
+            res = update_temporal_cvxpy(
+                cur_yra, cur_g, cur_tn, skip_deconvolution=skip_deconvolution, **kwargs
+            )
             res_ls.append(res)
         c = np.concatenate([r[0] for r in res_ls], axis=0) / norm_factor
         s = np.concatenate([r[1] for r in res_ls], axis=0) / norm_factor
@@ -1202,7 +1216,13 @@ def update_temporal_block(
 
 
 def update_temporal_cvxpy(
-    y: np.ndarray, g: np.ndarray, sn: np.ndarray, A=None, bseg=None, **kwargs
+    y: np.ndarray,
+    g: np.ndarray,
+    sn: np.ndarray,
+    A=None,
+    bseg=None,
+    skip_deconvolution=False,
+    **kwargs,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Solve the temporal update optimization problem using `cvxpy`
@@ -1251,6 +1271,11 @@ def update_temporal_cvxpy(
         Initial estimation of calcium traces for each cell used to warm start.
     zero_thres : float
         Threshold to filter out small values in the result.
+    skip_deconvolution : bool, optional
+        If True, skip the deconvolution optimization and return raw traces.
+        The calcium trace (c) will be set to the input y, deconvolved spikes (s)
+        will be set to y, baseline (b) will be set to minimum of y, and c0
+        will be set to zeros. By default `False`.
 
     See Also
     -------
@@ -1270,6 +1295,21 @@ def update_temporal_cvxpy(
     scs = kwargs.get("scs_fallback")
     c_last = kwargs.get("c_last")
     zero_thres = kwargs.get("zero_thres")
+
+    # NEW: Early return if skipping deconvolution
+    if skip_deconvolution:
+        # conform variables to generalize multiple unit case
+        if y.ndim < 2:
+            y = y.reshape((1, -1))
+
+        # Return raw traces instead of deconvolved ones
+        c = y.copy()  # calcium trace = raw trace
+        s = y.copy()  # deconvolved spikes = raw trace (no deconvolution)
+        b = np.min(y, axis=-1, keepdims=True)  # baseline = minimum of trace
+        c0 = np.zeros_like(y)  # initial calcium decay = zeros
+
+        return c, s, b, c0
+
     # conform variables to generalize multiple unit case
     if y.ndim < 2:
         y = y.reshape((1, -1))
@@ -1440,7 +1480,7 @@ def unit_merge(
     print("computing spatial overlap")
     with da.config.set(
         array_optimize=darr.optimization.optimize,
-        **{"optimization.fuse.subgraphs": False}
+        **{"optimization.fuse.subgraphs": False},
     ):
         A_sps = (A.data.map_blocks(sparse.COO) > 0).rechunk(-1).persist()
         A_inter = sparse.tril(
