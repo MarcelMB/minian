@@ -1,4 +1,4 @@
-name: minian
+name: minian-env
 channels:
   - bioconda
   - conda-forge
